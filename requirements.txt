@@ -6,3 +6,11 @@ transformers
 huggingface_hub
 scipy
 opencv-python-headless
+
+# Optional: DA3 engine (multi-image + better single-image depth)
+# Install from: https://github.com/ByteDance-Seed/Depth-Anything-3
+# pip install -e "path/to/Depth-Anything-3"
+
+# Optional: DA360 engine (panoramic depth)
+# Download checkpoint from: https://drive.google.com/drive/folders/1FMLWZfJ_IPKOa_cEbVqrq8_BRkl3oB_2
+# Use with: --da360-checkpoint path/to/DA360_large.pth

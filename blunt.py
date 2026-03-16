@@ -1,12 +1,18 @@
 """
 BLUNT -- Basic Lifting and UNprojection Tool
-Converts a single image (or 360 panorama) to a 3D Gaussian Splatting PLY file.
-Uses Depth Anything V2 Small (Apache 2.0) for depth estimation.
-All custom code -- fully commercial, no restrictively-licensed components.
+Converts images to 3D Gaussian Splatting PLY files.
+
+Depth engines:
+  - DA2: Depth Anything V2 Small (default, lightweight, Apache 2.0)
+  - DA3: Depth Anything 3 (better quality, multi-image support, requires depth-anything-3)
+  - DA360: Panoramic-native depth with circular padding (requires checkpoint)
 
 Usage:
-    python blunt.py input.jpg                                      # Single image
-    python blunt.py panorama.jpg --mode 360                        # 360 equirectangular
+    python blunt.py input.jpg                                      # Single image (DA2)
+    python blunt.py input.jpg --engine da3                         # Single image (DA3, better)
+    python blunt.py img1.jpg img2.jpg img3.jpg --mode multi        # Multi-image (DA3)
+    python blunt.py panorama.jpg --mode 360                        # 360 panorama (cube faces)
+    python blunt.py panorama.jpg --mode 360 --da360-checkpoint X   # 360 panorama (DA360)
     python blunt.py input.jpg --resolution 1536                    # Higher res (more splats)
     python blunt.py input.jpg --depth-mode metric-outdoor          # Metric depth
     python blunt.py input.jpg --no-sky                             # Skip sky Gaussians
@@ -65,6 +71,43 @@ def estimate_depth(image: Image.Image, processor, model, device: str = "cpu") ->
     ).squeeze().cpu().numpy()
 
     return depth.astype(np.float32)
+
+
+# --- DA3: Depth Anything 3 (optional) ----------------------------------------
+
+def load_da3_model(model_name: str = "da3-base", device: str = "cpu"):
+    """Load Depth Anything 3 model. Requires: pip install depth-anything-3"""
+    try:
+        from depth_anything_3.api import DepthAnything3
+    except ImportError:
+        raise ImportError(
+            "DA3 engine requires depth-anything-3.\n"
+            "Install: git clone https://github.com/ByteDance-Seed/Depth-Anything-3 && cd Depth-Anything-3 && pip install -e ."
+        )
+
+    print(f"Loading DA3 model: {model_name}...")
+    model = DepthAnything3.from_pretrained(f"depth-anything/{model_name.upper()}")
+    model = model.to(device=torch.device(device))
+    print("DA3 model loaded.")
+    return model
+
+
+def da3_single_depth(image_path: str, da3_model, process_res: int = 504):
+    """Run DA3 on a single image, return (depth, image_np, intrinsics)."""
+    prediction = da3_model.inference([image_path], process_res=process_res)
+    return (
+        prediction.depth[0],            # (H, W) float32
+        prediction.processed_images[0], # (H, W, 3) uint8
+        prediction.intrinsics[0],       # (3, 3) float32
+    )
+
+
+# --- DA360: Panoramic Depth (optional) ---------------------------------------
+
+def load_da360_model_wrapper(checkpoint_path: str, device: str = "cpu"):
+    """Load DA360 model from vendored code. Requires checkpoint file."""
+    from da360 import load_da360_model
+    return load_da360_model(checkpoint_path, device)
 
 
 # --- EXIF Focal Length --------------------------------------------------------
@@ -717,19 +760,230 @@ def generate_360(image, processor, model, device="cpu",
     return merge_gaussian_dicts(all_gaussians)
 
 
+# --- DA360 Equirectangular Pipeline ------------------------------------------
+
+def equirect_depth_to_gaussians(
+    image_np: np.ndarray,
+    depth: np.ndarray,
+    overlap_factor: float = 1.3,
+    depth_disc_threshold: float = 0.1,
+    flat_ratio: float = 0.1,
+    skip_sky: bool = False,
+    fast_mode: bool = False,
+) -> dict:
+    """Convert equirectangular RGB + depth into 3D Gaussians via spherical unprojection."""
+    from scipy.ndimage import median_filter
+
+    h, w = depth.shape
+    depth = median_filter(depth, size=3).astype(np.float32)
+
+    # Normalize to metric-like range
+    d_min, d_max = np.percentile(depth, [2, 98])
+    if d_max - d_min < 1e-6:
+        d_max = d_min + 1.0
+    depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+    near_plane, far_plane = 1.0, 100.0
+    disparity = np.maximum(depth_norm, 0.01)
+    inv_range = 1.0 / 0.01 - 1.0
+    metric_depth = near_plane + (1.0 / disparity - 1.0) / inv_range * (far_plane - near_plane)
+    metric_depth = np.clip(metric_depth, near_plane, far_plane).astype(np.float32)
+
+    sky_mask = detect_sky_mask(image_np, metric_depth, far_plane) if skip_sky else np.zeros((h, w), dtype=bool)
+
+    # Spherical coordinate grids
+    u = np.arange(w, dtype=np.float32)
+    v = np.arange(h, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+
+    lon = (uu / w - 0.5) * 2.0 * np.pi   # [-π, π]
+    lat = (0.5 - vv / h) * np.pi          # [π/2, -π/2]
+
+    # Spherical to Cartesian
+    x = metric_depth * np.cos(lat) * np.sin(lon)
+    y = -metric_depth * np.sin(lat)
+    z = metric_depth * np.cos(lat) * np.cos(lon)
+
+    # Depth discontinuity filter
+    grad_x = np.abs(np.diff(metric_depth, axis=1, prepend=metric_depth[:, :1]))
+    grad_y = np.abs(np.diff(metric_depth, axis=0, prepend=metric_depth[:1, :]))
+    max_grad = np.maximum(grad_x, grad_y)
+    keep_mask = max_grad < (depth_disc_threshold * metric_depth)
+
+    z_cull = np.percentile(metric_depth[keep_mask], 8)
+    keep_mask &= metric_depth > z_cull
+
+    if np.any(sky_mask) and skip_sky:
+        keep_mask &= ~sky_mask
+
+    floater_opacity_scale = prune_floaters(metric_depth, keep_mask)
+
+    if fast_mode:
+        keep_mask &= compute_importance_mask(metric_depth, image_np)
+
+    n_total = h * w
+    n_killed = n_total - int(np.sum(keep_mask))
+    print(f"  Depth filter: {n_killed:,} splats removed ({n_killed / n_total * 100:.1f}%)")
+
+    edge_proximity = max_grad[keep_mask] / np.maximum(metric_depth[keep_mask], 1e-6)
+    edge_scale_factor = np.clip(1.0 - edge_proximity * 5.0, 0.3, 1.0).astype(np.float32)
+
+    x_m, y_m, z_m = x[keep_mask], y[keep_mask], z[keep_mask]
+    d = metric_depth[keep_mask]
+    floater_scale = floater_opacity_scale[keep_mask]
+    colors = image_np[keep_mask]
+
+    # Scale based on solid angle per pixel at this latitude
+    lat_m = lat[keep_mask]
+    dtheta = 2.0 * np.pi / w
+    dphi = np.pi / h
+    scale_h = d * np.abs(np.cos(lat_m)) * dtheta * overlap_factor * edge_scale_factor
+    scale_v = d * dphi * overlap_factor * edge_scale_factor
+    scale_tangent = np.maximum(scale_h, scale_v)
+    scale_normal = scale_tangent * flat_ratio
+
+    rgb = colors.astype(np.float32) / 255.0
+    opacity = (4.6 * edge_scale_factor + 2.2 * (1.0 - edge_scale_factor)).astype(np.float32)
+    opacity *= floater_scale
+
+    # Camera-facing rotation (face toward origin)
+    view_dir = np.stack([x_m, y_m, z_m], axis=-1)
+    view_norm = np.sqrt(np.sum(view_dir**2, axis=-1, keepdims=True))
+    view_dir = view_dir / np.maximum(view_norm, 1e-8)
+    dot = view_dir[:, 2]
+    cross_x = -view_dir[:, 1]
+    cross_y = view_dir[:, 0]
+    qw = 1.0 + dot
+    anti = qw < 1e-6
+    qw[anti] = 0.0
+    cross_x[anti] = 1.0
+    cross_y[anti] = 0.0
+    q_norm = np.maximum(np.sqrt(qw**2 + cross_x**2 + cross_y**2), 1e-8)
+
+    n = len(x_m)
+    return {
+        "x": x_m.astype(np.float32), "y": y_m.astype(np.float32), "z": z_m.astype(np.float32),
+        "nx": np.zeros(n, np.float32), "ny": np.zeros(n, np.float32), "nz": np.zeros(n, np.float32),
+        "f_dc_0": ((rgb[:, 0] - 0.5) / SH_C0).astype(np.float32),
+        "f_dc_1": ((rgb[:, 1] - 0.5) / SH_C0).astype(np.float32),
+        "f_dc_2": ((rgb[:, 2] - 0.5) / SH_C0).astype(np.float32),
+        "opacity": opacity,
+        "scale_0": np.log(np.maximum(scale_tangent, 1e-7)).astype(np.float32),
+        "scale_1": np.log(np.maximum(scale_tangent, 1e-7)).astype(np.float32),
+        "scale_2": np.log(np.maximum(scale_normal, 1e-7)).astype(np.float32),
+        "rot_0": (qw / q_norm).astype(np.float32),
+        "rot_1": (cross_x / q_norm).astype(np.float32),
+        "rot_2": (cross_y / q_norm).astype(np.float32),
+        "rot_3": np.zeros(n, np.float32),
+    }
+
+
+def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
+                       overlap=1.3, disc_threshold=0.1, skip_sky=False, fast_mode=False):
+    """360 pipeline using DA360: single-pass panoramic depth, no cube faces."""
+    from da360 import estimate_depth_da360
+
+    image_rgb = image.convert("RGB")
+    image_np = np.array(image_rgb)
+    w, h = image_rgb.size
+    print(f"  DA360 input: {w}x{h}")
+
+    depth = estimate_depth_da360(image, da360_model, da360_h, da360_w, device)
+    print(f"  DA360 depth: range=[{depth.min():.2f}, {depth.max():.2f}]")
+
+    return equirect_depth_to_gaussians(
+        image_np, depth,
+        overlap_factor=overlap,
+        depth_disc_threshold=disc_threshold,
+        skip_sky=skip_sky,
+        fast_mode=fast_mode,
+    )
+
+
+# --- DA3 Multi-Image Pipeline ------------------------------------------------
+
+def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
+                   skip_sky=False, fast_mode=False):
+    """Multi-image pipeline using DA3: consistent depth + auto poses → merged Gaussians."""
+    print(f"  Running DA3 on {len(image_paths)} images...")
+    prediction = da3_model.inference(image_paths)
+
+    all_gaussians = []
+    n_images = prediction.depth.shape[0]
+
+    for i in range(n_images):
+        depth_map = prediction.depth[i]
+        image_np = prediction.processed_images[i]
+        ext = prediction.extrinsics[i]   # (3, 4) w2c
+        ixt = prediction.intrinsics[i]   # (3, 3)
+
+        h, w = depth_map.shape
+        fx, fy = ixt[0, 0], ixt[1, 1]
+        focal_length = (fx + fy) / 2.0
+
+        print(f"  Image {i+1}/{n_images}: {w}x{h}, focal={focal_length:.0f}px")
+
+        gaussians = depth_to_gaussians(
+            image_np, depth_map, focal_length,
+            overlap_factor=overlap,
+            depth_disc_threshold=disc_threshold,
+            is_metric=True,
+            skip_sky=skip_sky,
+            fast_mode=fast_mode,
+        )
+
+        # Transform camera-space → world-space using predicted extrinsics
+        R_w2c = ext[:3, :3]
+        t_w2c = ext[:3, 3]
+        R_c2w = R_w2c.T
+        t_c2w = -R_w2c.T @ t_w2c
+
+        pos = np.stack([gaussians["x"], gaussians["y"], gaussians["z"]], axis=-1)
+        pos_world = pos @ R_c2w.T + t_c2w
+        gaussians["x"] = pos_world[:, 0].astype(np.float32)
+        gaussians["y"] = pos_world[:, 1].astype(np.float32)
+        gaussians["z"] = pos_world[:, 2].astype(np.float32)
+
+        all_gaussians.append(gaussians)
+        print(f"    {len(gaussians['x']):,} splats")
+
+    return merge_gaussian_dicts(all_gaussians)
+
+
+def generate_single_da3(image_path, da3_model, overlap=1.3, disc_threshold=0.1,
+                        skip_sky=False, fast_mode=False):
+    """Single image pipeline using DA3 instead of DA2."""
+    depth, image_np, ixt = da3_single_depth(image_path, da3_model)
+    h, w = depth.shape
+    fx, fy = ixt[0, 0], ixt[1, 1]
+    focal_length = (fx + fy) / 2.0
+    print(f"  DA3 depth: {w}x{h}, focal={focal_length:.0f}px")
+
+    return depth_to_gaussians(
+        image_np, depth, focal_length,
+        overlap_factor=overlap,
+        depth_disc_threshold=disc_threshold,
+        is_metric=True,
+        skip_sky=skip_sky,
+        fast_mode=fast_mode,
+    )
+
+
 # --- CLI ----------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="BLUNT -- Basic Lifting and UNprojection Tool")
-    parser.add_argument("input", help="Input image path")
+    parser.add_argument("input", nargs="+", help="Input image path(s). Multiple paths for --mode multi.")
     parser.add_argument("-o", "--output", help="Output PLY path (default: input_splat.ply)")
-    parser.add_argument("--mode", choices=["single", "360"], default="single")
+    parser.add_argument("--mode", choices=["single", "360", "multi"], default=None,
+                        help="Pipeline mode (auto-detected if not set)")
+    parser.add_argument("--engine", choices=["da2", "da3", "da360"], default=None,
+                        help="Depth engine (auto-selected based on mode if not set)")
     parser.add_argument("--resolution", type=int, default=2048)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--overlap", type=float, default=1.3)
     parser.add_argument("--disc-threshold", type=float, default=0.1)
     parser.add_argument("--depth-mode", choices=["relative", "metric-indoor", "metric-outdoor"],
-                        default="relative", help="Depth model variant")
+                        default="relative", help="Depth model variant (DA2 only)")
     parser.add_argument("--fov", type=float, default=None,
                         help="Manual FOV override in degrees")
     parser.add_argument("--no-sky", action="store_true",
@@ -738,38 +992,106 @@ def main():
                         help="Adaptive stride mode (fewer splats, faster)")
     parser.add_argument("--segment", action="store_true",
                         help="Run SAM2 segmentation (generates .segments.bin + .segments.json)")
+    # DA3 options
+    parser.add_argument("--da3-model", type=str, default="DA3-BASE",
+                        help="DA3 model name (default: DA3-BASE, Apache 2.0)")
+    # DA360 options
+    parser.add_argument("--da360-checkpoint", type=str, default=None,
+                        help="Path to DA360 checkpoint (e.g., DA360_large.pth)")
     args = parser.parse_args()
 
+    # Auto-detect mode
+    if args.mode is None:
+        args.mode = "multi" if len(args.input) > 1 else "single"
+
+    # Auto-select engine
+    if args.engine is None:
+        if args.mode == "multi":
+            args.engine = "da3"
+        elif args.mode == "360" and args.da360_checkpoint:
+            args.engine = "da360"
+        elif args.mode == "360":
+            args.engine = "da2"
+        else:
+            args.engine = "da2"
+
+    # Validate
+    if args.mode == "multi" and args.engine != "da3":
+        parser.error("--mode multi requires --engine da3 (or omit --engine for auto)")
+    if args.engine == "da360" and not args.da360_checkpoint:
+        parser.error("--engine da360 requires --da360-checkpoint")
+
     if args.output is None:
-        stem = Path(args.input).stem
-        args.output = f"{stem}_splat.ply"
+        stem = Path(args.input[0]).stem
+        suffix = "_multi" if args.mode == "multi" else ""
+        args.output = f"{stem}{suffix}_splat.ply"
 
     start = time.time()
-    image = Image.open(args.input)
-    print(f"Input: {image.size[0]}x{image.size[1]}")
 
-    print("Loading depth model...")
-    processor, model = load_depth_model(args.device, args.depth_mode)
+    # --- Multi-image mode (DA3) ---
+    if args.mode == "multi":
+        print(f"Multi-image mode: {len(args.input)} images")
+        da3_model = load_da3_model(args.da3_model, args.device)
+        print("Generating splat...")
+        gaussians = generate_multi(
+            args.input, da3_model,
+            overlap=args.overlap, disc_threshold=args.disc_threshold,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+        )
+        write_ply(gaussians, args.output)
+        print(f"Total: {time.time() - start:.1f}s")
+        return
 
-    print("Generating splat...")
+    # --- Single input modes ---
+    image = Image.open(args.input[0])
+    print(f"Input: {image.size[0]}x{image.size[1]}, engine={args.engine}")
+
     segment_ids = None
-    if args.mode == "360":
-        gaussians = generate_360(image, processor, model, args.device,
-                                 face_size=args.resolution, overlap=args.overlap,
-                                 disc_threshold=args.disc_threshold,
-                                 depth_mode=args.depth_mode,
-                                 skip_sky=args.no_sky,
-                                 fast_mode=args.fast)
-    else:
-        result = generate_single(image, processor, model, args.device,
-                                 resolution=args.resolution, overlap=args.overlap,
-                                 disc_threshold=args.disc_threshold,
-                                 depth_mode=args.depth_mode,
-                                 fov_override=args.fov,
-                                 skip_sky=args.no_sky,
-                                 fast_mode=args.fast,
-                                 segment=args.segment)
 
+    if args.mode == "360" and args.engine == "da360":
+        # DA360: single-pass panoramic depth
+        da360_model, da360_h, da360_w = load_da360_model_wrapper(args.da360_checkpoint, args.device)
+        print("Generating splat (DA360)...")
+        gaussians = generate_360_da360(
+            image, da360_model, da360_h, da360_w, args.device,
+            overlap=args.overlap, disc_threshold=args.disc_threshold,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+        )
+
+    elif args.mode == "360":
+        # DA2: cube face fallback
+        print("Loading depth model...")
+        processor, model = load_depth_model(args.device, args.depth_mode)
+        print("Generating splat (cube faces)...")
+        gaussians = generate_360(
+            image, processor, model, args.device,
+            face_size=args.resolution, overlap=args.overlap,
+            disc_threshold=args.disc_threshold, depth_mode=args.depth_mode,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+        )
+
+    elif args.engine == "da3":
+        # DA3: single image
+        da3_model = load_da3_model(args.da3_model, args.device)
+        print("Generating splat (DA3)...")
+        gaussians = generate_single_da3(
+            args.input[0], da3_model,
+            overlap=args.overlap, disc_threshold=args.disc_threshold,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+        )
+
+    else:
+        # DA2: single image (default)
+        print("Loading depth model...")
+        processor, model = load_depth_model(args.device, args.depth_mode)
+        print("Generating splat...")
+        result = generate_single(
+            image, processor, model, args.device,
+            resolution=args.resolution, overlap=args.overlap,
+            disc_threshold=args.disc_threshold, depth_mode=args.depth_mode,
+            fov_override=args.fov, skip_sky=args.no_sky,
+            fast_mode=args.fast, segment=args.segment,
+        )
         if args.segment:
             gaussians, segment_ids = result
         else:
