@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 run_sharp_comparison.py
+
+# Allow example outputs (SOG only — PLY too large for GitHub)
+!examples/outputs/*.sog
