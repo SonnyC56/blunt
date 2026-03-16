@@ -1,0 +1,5 @@
+*.ply
+*.sog
+__pycache__/
+*.pyc
+run_sharp_comparison.py
