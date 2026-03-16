@@ -902,10 +902,10 @@ def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
 # --- DA3 Multi-Image Pipeline ------------------------------------------------
 
 def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
-                   skip_sky=False, fast_mode=False):
+                   skip_sky=False, fast_mode=False, resolution=2048):
     """Multi-image pipeline using DA3: consistent depth + auto poses → merged Gaussians."""
     print(f"  Running DA3 on {len(image_paths)} images...")
-    prediction = da3_model.inference(image_paths)
+    prediction = da3_model.inference(image_paths, process_res=resolution)
 
     all_gaussians = []
     n_images = prediction.depth.shape[0]
@@ -950,9 +950,9 @@ def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
 
 
 def generate_single_da3(image_path, da3_model, overlap=1.3, disc_threshold=0.1,
-                        skip_sky=False, fast_mode=False):
+                        skip_sky=False, fast_mode=False, resolution=2048):
     """Single image pipeline using DA3 instead of DA2."""
-    depth, image_np, ixt = da3_single_depth(image_path, da3_model)
+    depth, image_np, ixt = da3_single_depth(image_path, da3_model, process_res=resolution)
     h, w = depth.shape
     fx, fy = ixt[0, 0], ixt[1, 1]
     focal_length = (fx + fy) / 2.0
@@ -1037,6 +1037,7 @@ def main():
             args.input, da3_model,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
             skip_sky=args.no_sky, fast_mode=args.fast,
+            resolution=args.resolution,
         )
         write_ply(gaussians, args.output)
         print(f"Total: {time.time() - start:.1f}s")
@@ -1078,6 +1079,7 @@ def main():
             args.input[0], da3_model,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
             skip_sky=args.no_sky, fast_mode=args.fast,
+            resolution=args.resolution,
         )
 
     else:
