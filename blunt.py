@@ -1034,7 +1034,7 @@ def equirect_depth_to_gaussians(
 
 def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
                        overlap=1.3, disc_threshold=0.1, skip_sky=False, fast_mode=False,
-                       inpaint=True, resolution=4096):
+                       inpaint=True, resolution=6144):
     """360 pipeline using DA360: single-pass panoramic depth, no cube faces.
 
     resolution controls the unprojection grid width (height = width/2).
@@ -1252,12 +1252,14 @@ def main():
         # DA360: single-pass panoramic depth
         da360_model, da360_h, da360_w = load_da360_model_wrapper(args.da360_checkpoint, args.device)
         print("Generating splat (DA360)...")
+        # Use 6144 default for DA360 unless user explicitly set --resolution
+        da360_res = args.resolution if args.resolution != 2048 else 6144
         gaussians = generate_360_da360(
             image, da360_model, da360_h, da360_w, args.device,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
             skip_sky=args.no_sky, fast_mode=args.fast,
             inpaint=not args.no_inpaint,
-            resolution=args.resolution,
+            resolution=da360_res,
         )
 
     elif args.mode == "360":
