@@ -770,6 +770,7 @@ def equirect_depth_to_gaussians(
     flat_ratio: float = 0.1,
     skip_sky: bool = False,
     fast_mode: bool = False,
+    input_is_depth: bool = False,
 ) -> dict:
     """Convert equirectangular RGB + depth into 3D Gaussians via spherical unprojection."""
     from scipy.ndimage import median_filter
@@ -777,15 +778,25 @@ def equirect_depth_to_gaussians(
     h, w = depth.shape
     depth = median_filter(depth, size=3).astype(np.float32)
 
-    # Normalize to metric-like range
-    d_min, d_max = np.percentile(depth, [2, 98])
-    if d_max - d_min < 1e-6:
-        d_max = d_min + 1.0
-    depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
     near_plane, far_plane = 1.0, 100.0
-    disparity = np.maximum(depth_norm, 0.01)
-    inv_range = 1.0 / 0.01 - 1.0
-    metric_depth = near_plane + (1.0 / disparity - 1.0) / inv_range * (far_plane - near_plane)
+
+    if input_is_depth:
+        # Input is already proper depth (e.g. from DA360) — just rescale to [near, far]
+        d_min, d_max = np.percentile(depth, [2, 98])
+        if d_max - d_min < 1e-6:
+            d_max = d_min + 1.0
+        depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+        metric_depth = near_plane + depth_norm * (far_plane - near_plane)
+    else:
+        # Input is disparity-like (DA2) — invert to get depth
+        d_min, d_max = np.percentile(depth, [2, 98])
+        if d_max - d_min < 1e-6:
+            d_max = d_min + 1.0
+        depth_norm = np.clip((depth - d_min) / (d_max - d_min), 0.0, 1.0)
+        disparity = np.maximum(depth_norm, 0.01)
+        inv_range = 1.0 / 0.01 - 1.0
+        metric_depth = near_plane + (1.0 / disparity - 1.0) / inv_range * (far_plane - near_plane)
+
     metric_depth = np.clip(metric_depth, near_plane, far_plane).astype(np.float32)
 
     sky_mask = detect_sky_mask(image_np, metric_depth, far_plane) if skip_sky else np.zeros((h, w), dtype=bool)
@@ -896,6 +907,7 @@ def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
         depth_disc_threshold=disc_threshold,
         skip_sky=skip_sky,
         fast_mode=fast_mode,
+        input_is_depth=True,
     )
 
 
@@ -1056,7 +1068,7 @@ def main():
         gaussians = generate_360_da360(
             image, da360_model, da360_h, da360_w, args.device,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
-            skip_sky=args.no_sky, fast_mode=args.fast,
+            skip_sky=args.no_sky, fast_mode=True,
         )
 
     elif args.mode == "360":
@@ -1068,7 +1080,7 @@ def main():
             image, processor, model, args.device,
             face_size=args.resolution, overlap=args.overlap,
             disc_threshold=args.disc_threshold, depth_mode=args.depth_mode,
-            skip_sky=args.no_sky, fast_mode=args.fast,
+            skip_sky=args.no_sky, fast_mode=True,
         )
 
     elif args.engine == "da3":
