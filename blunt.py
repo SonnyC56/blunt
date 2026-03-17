@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+from typing import Optional, Union
 import time
 import math
 from pathlib import Path
@@ -112,7 +113,7 @@ def load_da360_model_wrapper(checkpoint_path: str, device: str = "cpu"):
 
 # --- EXIF Focal Length --------------------------------------------------------
 
-def extract_focal_from_exif(image: Image.Image, w: int, h: int) -> float | None:
+def extract_focal_from_exif(image: Image.Image, w: int, h: int) -> Optional[float]:
     """Extract focal length from EXIF data, return as pixels or None."""
     try:
         exif = image.getexif()
@@ -350,7 +351,7 @@ def depth_to_gaussians(
     fast_mode: bool = False,
     return_keep_mask: bool = False,
     inpaint: bool = True,
-) -> dict | tuple:
+) -> Union[dict, tuple]:
     """
     Convert an RGB image + depth map into 3D Gaussian Splatting parameters.
     """
