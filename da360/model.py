@@ -46,8 +46,26 @@ class DA360(nn.Module):
         return {"pred_disp": ssidisp + shift}
 
 
-def load_da360_model(checkpoint_path, device="cpu"):
-    """Load DA360 model from checkpoint file."""
+DEFAULT_DA360_HF_REPO = "storysplat/DA360-Large"
+DEFAULT_DA360_HF_FILENAME = "DA360_large.pth"
+
+
+def load_da360_model(checkpoint_path=None, device="cpu"):
+    """Load DA360 model from a local checkpoint or auto-download from HuggingFace."""
+    import os
+    from pathlib import Path
+
+    if checkpoint_path is None or not os.path.isfile(checkpoint_path):
+        # Auto-download from HuggingFace
+        from huggingface_hub import hf_hub_download
+        repo_id = checkpoint_path if checkpoint_path and "/" in checkpoint_path else DEFAULT_DA360_HF_REPO
+        print(f"Downloading DA360 checkpoint from HuggingFace: {repo_id}...")
+        checkpoint_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=DEFAULT_DA360_HF_FILENAME,
+        )
+        print(f"Cached at: {checkpoint_path}")
+
     print(f"Loading DA360 checkpoint: {checkpoint_path}")
     model_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 

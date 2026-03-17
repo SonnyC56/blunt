@@ -5,14 +5,14 @@ Converts images to 3D Gaussian Splatting PLY files.
 Depth engines:
   - DA2: Depth Anything V2 Small (default, lightweight, Apache 2.0)
   - DA3: Depth Anything 3 (better quality, multi-image support, requires depth-anything-3)
-  - DA360: Panoramic-native depth with circular padding (requires checkpoint)
+  - DA360: Panoramic-native depth with circular padding (auto-downloads from HuggingFace)
 
 Usage:
-    python blunt.py input.jpg                                      # Single image (DA2)
-    python blunt.py input.jpg --engine da3                         # Single image (DA3, better)
+    python blunt.py input.jpg                                      # Single image (DA3)
+    python blunt.py input.jpg --engine da2                         # Single image (DA2 fallback)
     python blunt.py img1.jpg img2.jpg img3.jpg --mode multi        # Multi-image (DA3)
-    python blunt.py panorama.jpg --mode 360                        # 360 panorama (cube faces)
-    python blunt.py panorama.jpg --mode 360 --da360-checkpoint X   # 360 panorama (DA360)
+    python blunt.py panorama.jpg --mode 360                        # 360 panorama (DA360, auto-downloads)
+    python blunt.py panorama.jpg --mode 360 --da360-checkpoint X   # 360 panorama (local checkpoint)
     python blunt.py input.jpg --resolution 1536                    # Higher res (more splats)
     python blunt.py input.jpg --depth-mode metric-outdoor          # Metric depth
     python blunt.py input.jpg --no-sky                             # Skip sky Gaussians
@@ -263,6 +263,75 @@ def compute_importance_mask(metric_depth: np.ndarray, image_np: np.ndarray) -> n
 
 
 
+# --- Occlusion Inpainting ----------------------------------------------------
+
+def inpaint_occlusions(
+    image_np: np.ndarray,
+    depth: np.ndarray,
+    disc_threshold: float = 0.1,
+    dilate_px: int = 5,
+    inpaint_radius: int = 7,
+) -> tuple:
+    """
+    Fill shadow regions behind depth discontinuities by inpainting both
+    the depth map and color image. Returns (inpainted_image, inpainted_depth).
+
+    image_np and depth must be the same spatial resolution.
+    """
+    import cv2
+
+    h, w = depth.shape
+
+    # Find depth discontinuities (same gradient logic as the filter)
+    grad_x = np.abs(np.diff(depth, axis=1, prepend=depth[:, :1]))
+    grad_y = np.abs(np.diff(depth, axis=0, prepend=depth[:1, :]))
+    max_grad = np.maximum(grad_x, grad_y)
+    disc_mask = max_grad >= (disc_threshold * np.maximum(depth, 1e-8))
+
+    # Dilate to cover full shadow region behind edges
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+    inpaint_mask = cv2.dilate(disc_mask.astype(np.uint8), kernel, iterations=1)
+
+    n_pixels = int(inpaint_mask.sum())
+    if n_pixels == 0:
+        return image_np, depth
+
+    pct = n_pixels / (h * w) * 100
+    print(f"  Inpainting {n_pixels:,} occlusion pixels ({pct:.1f}%)")
+
+    # Inpaint depth: scale to uint8 range for cv2.inpaint, then scale back
+    d_min, d_max = depth.min(), depth.max()
+    d_range = d_max - d_min if d_max - d_min > 1e-8 else 1.0
+    depth_u8 = ((depth - d_min) / d_range * 255).astype(np.uint8)
+    depth_inpainted_u8 = cv2.inpaint(depth_u8, inpaint_mask, inpaint_radius, cv2.INPAINT_TELEA)
+    depth_inpainted = depth_inpainted_u8.astype(np.float32) / 255.0 * d_range + d_min
+
+    # Only replace masked pixels (keep original data elsewhere)
+    mask_bool = inpaint_mask.astype(bool)
+    depth_out = depth.copy()
+    depth_out[mask_bool] = depth_inpainted[mask_bool]
+
+    # Inpaint color
+    image_inpainted = cv2.inpaint(image_np, inpaint_mask, inpaint_radius, cv2.INPAINT_TELEA)
+    image_out = image_np.copy()
+    image_out[mask_bool] = image_inpainted[mask_bool]
+
+    return image_out, depth_out
+
+
+def inpaint_color_from_mask(image_np: np.ndarray, inpaint_mask: np.ndarray,
+                            inpaint_radius: int = 7) -> np.ndarray:
+    """Inpaint a color image using a pre-computed binary mask (uint8, 0/1)."""
+    import cv2
+    mask_bool = inpaint_mask.astype(bool)
+    if not np.any(mask_bool):
+        return image_np
+    image_inpainted = cv2.inpaint(image_np, inpaint_mask, inpaint_radius, cv2.INPAINT_TELEA)
+    image_out = image_np.copy()
+    image_out[mask_bool] = image_inpainted[mask_bool]
+    return image_out
+
+
 # --- Depth to Gaussian Conversion --------------------------------------------
 
 SH_C0 = 0.28209479177387814
@@ -280,6 +349,7 @@ def depth_to_gaussians(
     skip_sky: bool = False,
     fast_mode: bool = False,
     return_keep_mask: bool = False,
+    inpaint: bool = True,
 ) -> dict | tuple:
     """
     Convert an RGB image + depth map into 3D Gaussian Splatting parameters.
@@ -291,6 +361,30 @@ def depth_to_gaussians(
 
     # Median filter for noise reduction
     depth = median_filter(depth, size=3).astype(np.float32)
+
+    # Inpaint occlusion shadows before unprojection
+    if inpaint:
+        import cv2
+        image_np, depth = inpaint_occlusions(
+            image_np, depth, disc_threshold=depth_disc_threshold,
+        )
+        if color_image_np is not None and color_image_np.shape[:2] != image_np.shape[:2]:
+            # High-res color at different resolution: compute mask from depth,
+            # scale mask up to color resolution, then inpaint color separately
+            grad_x = np.abs(np.diff(depth, axis=1, prepend=depth[:, :1]))
+            grad_y = np.abs(np.diff(depth, axis=0, prepend=depth[:1, :]))
+            max_grad = np.maximum(grad_x, grad_y)
+            disc_mask = max_grad >= (depth_disc_threshold * np.maximum(depth, 1e-8))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            mask_lo = cv2.dilate(disc_mask.astype(np.uint8), kernel, iterations=1)
+            h_hi, w_hi = color_image_np.shape[:2]
+            mask_hi = cv2.resize(mask_lo, (w_hi, h_hi), interpolation=cv2.INTER_NEAREST)
+            color_image_np = inpaint_color_from_mask(color_image_np, mask_hi)
+        elif color_image_np is not None:
+            # Same resolution: inpaint directly
+            color_image_np, _ = inpaint_occlusions(
+                color_image_np, depth, disc_threshold=depth_disc_threshold,
+            )
 
     if is_metric:
         metric_depth = np.clip(depth, 0.01, 1000.0).astype(np.float32)
@@ -327,9 +421,10 @@ def depth_to_gaussians(
     max_grad = np.maximum(grad_x, grad_y)
     keep_mask = max_grad < (depth_disc_threshold * metric_depth)
 
-    # Near-camera cull
-    z_cull = np.percentile(metric_depth[keep_mask], 8)
-    keep_mask &= metric_depth > z_cull
+    # Near-camera cull (remove closest 2% to avoid curved-shell artifacts, DA2 only)
+    if not is_metric:
+        z_cull = np.percentile(metric_depth[keep_mask], 2)
+        keep_mask &= metric_depth > z_cull
 
     # Sky handling
     if np.any(sky_mask):
@@ -612,6 +707,42 @@ def merge_gaussian_dicts(all_gaussians):
     return merged
 
 
+# --- Gaussian Normalization ---------------------------------------------------
+
+def normalize_gaussians(gaussians, target_extent=50.0):
+    """
+    Normalize gaussian positions so the scene fits within [-target_extent, target_extent].
+    Scales gaussian sizes (log-space) accordingly. This ensures consistent scale
+    across all depth engines (DA2, DA3, DA360) for viewer compatibility.
+    """
+    positions = np.stack([gaussians["x"], gaussians["y"], gaussians["z"]], axis=-1)
+
+    # Center on median (robust to outliers)
+    center = np.median(positions, axis=0)
+    positions -= center
+
+    # Find 98th percentile extent (ignore outliers)
+    max_extent = np.percentile(np.abs(positions), 98)
+    if max_extent < 1e-6:
+        max_extent = 1.0
+
+    scale_factor = target_extent / max_extent
+    positions *= scale_factor
+
+    gaussians["x"] = positions[:, 0].astype(np.float32)
+    gaussians["y"] = positions[:, 1].astype(np.float32)
+    gaussians["z"] = positions[:, 2].astype(np.float32)
+
+    # Scale gaussian sizes (stored in log-space)
+    log_sf = np.float32(np.log(scale_factor))
+    gaussians["scale_0"] = gaussians["scale_0"] + log_sf
+    gaussians["scale_1"] = gaussians["scale_1"] + log_sf
+    gaussians["scale_2"] = gaussians["scale_2"] + log_sf
+
+    print(f"  Normalized: scale_factor={scale_factor:.2f}x, center=[{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
+    return gaussians
+
+
 # --- PLY Writer ---------------------------------------------------------------
 
 def write_ply(gaussians, output_path):
@@ -649,7 +780,8 @@ def write_ply(gaussians, output_path):
 def generate_single(image, processor, model, device="cpu",
                     resolution=2048, overlap=1.3, disc_threshold=0.1,
                     depth_mode="relative", fov_override=None,
-                    skip_sky=False, fast_mode=False, segment=False):
+                    skip_sky=False, fast_mode=False, segment=False,
+                    inpaint=True):
     """Single image pipeline: returns Gaussian dict (and optionally segment_ids)."""
     w_orig, h_orig = image.size
     image_rgb = image.convert("RGB")
@@ -706,6 +838,7 @@ def generate_single(image, processor, model, device="cpu",
             skip_sky=skip_sky,
             fast_mode=fast_mode,
             return_keep_mask=True,
+            inpaint=inpaint,
         )
         segment_ids = segment_map[keep_mask]
         return gaussians, segment_ids
@@ -718,6 +851,7 @@ def generate_single(image, processor, model, device="cpu",
         is_metric=is_metric,
         skip_sky=skip_sky,
         fast_mode=fast_mode,
+        inpaint=inpaint,
     )
 
     return gaussians
@@ -725,7 +859,8 @@ def generate_single(image, processor, model, device="cpu",
 
 def generate_360(image, processor, model, device="cpu",
                  face_size=1024, overlap=1.3, disc_threshold=0.1,
-                 depth_mode="relative", skip_sky=False, fast_mode=False):
+                 depth_mode="relative", skip_sky=False, fast_mode=False,
+                 inpaint=True):
     """360 equirectangular pipeline: returns Gaussian dict."""
     image_rgb = image.convert("RGB")
     pano_np = np.array(image_rgb)
@@ -748,6 +883,7 @@ def generate_360(image, processor, model, device="cpu",
             is_metric=is_metric,
             skip_sky=skip_sky,
             fast_mode=fast_mode,
+            inpaint=inpaint,
         )
         gaussians = transform_gaussians_to_world(gaussians, R_face)
 
@@ -771,12 +907,19 @@ def equirect_depth_to_gaussians(
     skip_sky: bool = False,
     fast_mode: bool = False,
     input_is_depth: bool = False,
+    inpaint: bool = True,
 ) -> dict:
     """Convert equirectangular RGB + depth into 3D Gaussians via spherical unprojection."""
     from scipy.ndimage import median_filter
 
     h, w = depth.shape
     depth = median_filter(depth, size=3).astype(np.float32)
+
+    # Inpaint occlusion shadows before unprojection
+    if inpaint:
+        image_np, depth = inpaint_occlusions(
+            image_np, depth, disc_threshold=depth_disc_threshold,
+        )
 
     near_plane, far_plane = 1.0, 100.0
 
@@ -820,8 +963,9 @@ def equirect_depth_to_gaussians(
     max_grad = np.maximum(grad_x, grad_y)
     keep_mask = max_grad < (depth_disc_threshold * metric_depth)
 
-    z_cull = np.percentile(metric_depth[keep_mask], 8)
-    keep_mask &= metric_depth > z_cull
+    if not input_is_depth:
+        z_cull = np.percentile(metric_depth[keep_mask], 2)
+        keep_mask &= metric_depth > z_cull
 
     if np.any(sky_mask) and skip_sky:
         keep_mask &= ~sky_mask
@@ -889,17 +1033,35 @@ def equirect_depth_to_gaussians(
 
 
 def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
-                       overlap=1.3, disc_threshold=0.1, skip_sky=False, fast_mode=False):
-    """360 pipeline using DA360: single-pass panoramic depth, no cube faces."""
+                       overlap=1.3, disc_threshold=0.1, skip_sky=False, fast_mode=False,
+                       inpaint=True, resolution=4096):
+    """360 pipeline using DA360: single-pass panoramic depth, no cube faces.
+
+    resolution controls the unprojection grid width (height = width/2).
+    The depth model runs at its native resolution regardless; this controls
+    how densely splats are sampled from the depth map.
+    """
+    import cv2
     from da360 import estimate_depth_da360
 
     image_rgb = image.convert("RGB")
     image_np = np.array(image_rgb)
-    w, h = image_rgb.size
-    print(f"  DA360 input: {w}x{h}")
+    w_orig, h_orig = image_rgb.size
+    print(f"  DA360 input: {w_orig}x{h_orig}")
 
     depth = estimate_depth_da360(image, da360_model, da360_h, da360_w, device)
     print(f"  DA360 depth: range=[{depth.min():.2f}, {depth.max():.2f}]")
+
+    # Resample image and depth to unprojection resolution
+    # This controls splat density without affecting depth quality
+    unproj_w = min(resolution, w_orig)
+    unproj_h = unproj_w // 2
+    if unproj_w < w_orig:
+        print(f"  Unprojection grid: {unproj_w}x{unproj_h} ({unproj_w * unproj_h:,} pixels)")
+        image_np = cv2.resize(image_np, (unproj_w, unproj_h), interpolation=cv2.INTER_LANCZOS4)
+        depth = cv2.resize(depth, (unproj_w, unproj_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        print(f"  Unprojection grid: {w_orig}x{h_orig} (full resolution)")
 
     return equirect_depth_to_gaussians(
         image_np, depth,
@@ -908,13 +1070,15 @@ def generate_360_da360(image, da360_model, da360_h, da360_w, device="cpu",
         skip_sky=skip_sky,
         fast_mode=fast_mode,
         input_is_depth=True,
+        inpaint=inpaint,
     )
 
 
 # --- DA3 Multi-Image Pipeline ------------------------------------------------
 
 def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
-                   skip_sky=False, fast_mode=False, resolution=2048):
+                   skip_sky=False, fast_mode=False, resolution=2048,
+                   inpaint=True):
     """Multi-image pipeline using DA3: consistent depth + auto poses → merged Gaussians."""
     print(f"  Running DA3 on {len(image_paths)} images...")
     prediction = da3_model.inference(image_paths, process_res=resolution)
@@ -941,6 +1105,7 @@ def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
             is_metric=True,
             skip_sky=skip_sky,
             fast_mode=fast_mode,
+            inpaint=inpaint,
         )
 
         # Transform camera-space → world-space using predicted extrinsics
@@ -962,7 +1127,8 @@ def generate_multi(image_paths, da3_model, overlap=1.3, disc_threshold=0.1,
 
 
 def generate_single_da3(image_path, da3_model, overlap=1.3, disc_threshold=0.1,
-                        skip_sky=False, fast_mode=False, resolution=2048):
+                        skip_sky=False, fast_mode=False, resolution=2048,
+                        inpaint=True):
     """Single image pipeline using DA3 instead of DA2."""
     depth, image_np, ixt = da3_single_depth(image_path, da3_model, process_res=resolution)
     h, w = depth.shape
@@ -977,6 +1143,7 @@ def generate_single_da3(image_path, da3_model, overlap=1.3, disc_threshold=0.1,
         is_metric=True,
         skip_sky=skip_sky,
         fast_mode=fast_mode,
+        inpaint=inpaint,
     )
 
 
@@ -1000,6 +1167,10 @@ def main():
                         help="Manual FOV override in degrees")
     parser.add_argument("--no-sky", action="store_true",
                         help="Skip sky Gaussians entirely")
+    parser.add_argument("--no-inpaint", action="store_true",
+                        help="Disable occlusion inpainting (shadow filling)")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Skip position/scale normalization (raw depth values)")
     parser.add_argument("--fast", action="store_true",
                         help="Adaptive stride mode (fewer splats, faster)")
     parser.add_argument("--segment", action="store_true",
@@ -1016,7 +1187,20 @@ def main():
     if args.mode is None:
         args.mode = "multi" if len(args.input) > 1 else "single"
 
-    # Auto-select engine
+    # Auto-find DA360 checkpoint if not specified
+    if args.mode == "360" and args.da360_checkpoint is None:
+        # Look for checkpoint in common locations relative to script
+        script_dir = Path(__file__).parent
+        for candidate in [
+            script_dir / "da360" / "DA360_large.pth",
+            script_dir / "DA360_large.pth",
+        ]:
+            if candidate.exists():
+                args.da360_checkpoint = str(candidate)
+                print(f"Auto-found DA360 checkpoint: {args.da360_checkpoint}")
+                break
+
+    # Auto-select engine: DA3 default for single/multi, DA360 for 360 if checkpoint available
     if args.engine is None:
         if args.mode == "multi":
             args.engine = "da3"
@@ -1025,13 +1209,14 @@ def main():
         elif args.mode == "360":
             args.engine = "da2"
         else:
-            args.engine = "da2"
+            args.engine = "da3"
 
     # Validate
     if args.mode == "multi" and args.engine != "da3":
         parser.error("--mode multi requires --engine da3 (or omit --engine for auto)")
     if args.engine == "da360" and not args.da360_checkpoint:
-        parser.error("--engine da360 requires --da360-checkpoint")
+        # Will auto-download from HuggingFace
+        print("No DA360 checkpoint specified — will auto-download from HuggingFace on first use.")
 
     if args.output is None:
         stem = Path(args.input[0]).stem
@@ -1049,8 +1234,10 @@ def main():
             args.input, da3_model,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
             skip_sky=args.no_sky, fast_mode=args.fast,
-            resolution=args.resolution,
+            resolution=args.resolution, inpaint=not args.no_inpaint,
         )
+        if not args.no_normalize:
+            gaussians = normalize_gaussians(gaussians)
         write_ply(gaussians, args.output)
         print(f"Total: {time.time() - start:.1f}s")
         return
@@ -1068,7 +1255,9 @@ def main():
         gaussians = generate_360_da360(
             image, da360_model, da360_h, da360_w, args.device,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
-            skip_sky=args.no_sky, fast_mode=True,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+            inpaint=not args.no_inpaint,
+            resolution=args.resolution,
         )
 
     elif args.mode == "360":
@@ -1080,7 +1269,8 @@ def main():
             image, processor, model, args.device,
             face_size=args.resolution, overlap=args.overlap,
             disc_threshold=args.disc_threshold, depth_mode=args.depth_mode,
-            skip_sky=args.no_sky, fast_mode=True,
+            skip_sky=args.no_sky, fast_mode=args.fast,
+            inpaint=not args.no_inpaint,
         )
 
     elif args.engine == "da3":
@@ -1091,7 +1281,7 @@ def main():
             args.input[0], da3_model,
             overlap=args.overlap, disc_threshold=args.disc_threshold,
             skip_sky=args.no_sky, fast_mode=args.fast,
-            resolution=args.resolution,
+            resolution=args.resolution, inpaint=not args.no_inpaint,
         )
 
     else:
@@ -1105,12 +1295,15 @@ def main():
             disc_threshold=args.disc_threshold, depth_mode=args.depth_mode,
             fov_override=args.fov, skip_sky=args.no_sky,
             fast_mode=args.fast, segment=args.segment,
+            inpaint=not args.no_inpaint,
         )
         if args.segment:
             gaussians, segment_ids = result
         else:
             gaussians = result
 
+    if not args.no_normalize:
+        gaussians = normalize_gaussians(gaussians)
     write_ply(gaussians, args.output)
 
     if args.segment and segment_ids is not None:

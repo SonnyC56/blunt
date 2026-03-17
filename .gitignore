@@ -1,5 +1,6 @@
 *.ply
 *.sog
+*.pth
 __pycache__/
 *.pyc
 .venv/
