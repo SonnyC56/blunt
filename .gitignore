@@ -1,7 +1,9 @@
 *.ply
 *.sog
+*.pth
 __pycache__/
 *.pyc
+.venv/
 run_sharp_comparison.py
 
 # Allow example outputs (SOG only — PLY too large for GitHub)
