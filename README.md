@@ -4,26 +4,6 @@
 
 Turn any photo into a 3D Gaussian Splat in seconds. Supports single images, multi-image reconstruction, and 360 panoramas.
 
-Three depth engines:
-- **DA3** (default for single + multi) -- Depth Anything 3. Best quality, multi-image support. Apache 2.0 (base/small).
-- **DA360** (default for 360 when checkpoint found) -- Panoramic-native depth with circular padding. No seam artifacts for 360. Auto-downloads from HuggingFace when using `--engine da360`. MIT.
-- **DA2** -- Depth Anything V2 Small. Lightweight fallback, runs on CPU with no extra dependencies. Apache 2.0.
-
-### Default Engine Selection
-
-| Mode | Default Engine | Condition |
-|------|---------------|-----------|
-| `single` | DA3 | Always |
-| `multi` | DA3 | Always (DA3 required) |
-| `360` | DA360 | If a local checkpoint is found in `da360/DA360_large.pth` |
-| `360` | DA2 | Fallback when no local checkpoint is found |
-
-To force DA360 with auto-download (no local checkpoint needed):
-
-```bash
-python blunt.py panorama.jpg --mode 360 --engine da360 --device cuda
-```
-
 ## Installation
 
 Requires **Python 3.9+** and **pip**.
@@ -45,83 +25,135 @@ cd Depth-Anything-3 && pip install -e .
 
 ### Step 3 (optional): DA360 for 360 panoramas
 
-The DA360 checkpoint (~1.4GB) is auto-downloaded from HuggingFace when you use `--engine da360`. No manual setup is needed. To use a local checkpoint instead:
+The DA360 checkpoint (~1.4GB) is auto-downloaded from HuggingFace when you use `--engine da360`. No manual setup is needed. To use a local checkpoint instead, place it at `da360/DA360_large.pth` (relative to `blunt.py`) and it will be auto-detected as the default for `--mode 360`.
+
+## Three Modes
+
+| Mode | Trigger | Default Engine |
+|------|---------|----------------|
+| **Single image** | One file (default) | DA3 (best quality) |
+| **360 panorama** | `--mode 360` | DA360 (auto-downloads checkpoint) |
+| **Multi-image** | Multiple files | DA3 (joint depth + poses) |
 
 ```bash
+# Single image -- just works
+python blunt.py photo.jpg --device cuda
+
+# 360 panorama -- just works (auto-downloads DA360 from HuggingFace)
+python blunt.py panorama.jpg --mode 360 --device cuda
+
+# Multi-image -- auto-detected from multiple inputs
+python blunt.py img1.jpg img2.jpg img3.jpg --device cuda
+```
+
+## Depth Engines
+
+| Engine | Flag | Use Case |
+|--------|------|----------|
+| **DA3** (default) | `--engine da3` | Best quality, metric depth, predicted intrinsics |
+| **DA360** (default for 360) | `--engine da360` | Panoramic-native, no seams, circular padding |
+| **DA2** (fallback) | `--engine da2` | Lightweight, no DA3 dependency, runs on CPU |
+
+```bash
+# Force DA2 (no DA3 install needed)
+python blunt.py photo.jpg --engine da2 --device cuda
+
+# Force DA360 with auto-download (even without local checkpoint)
+python blunt.py panorama.jpg --mode 360 --engine da360 --device cuda
+
+# Use a local DA360 checkpoint
 python blunt.py panorama.jpg --mode 360 --da360-checkpoint /path/to/DA360_large.pth --device cuda
 ```
 
-If you place the checkpoint at `da360/DA360_large.pth` (relative to `blunt.py`), it will be auto-detected and DA360 becomes the default engine for 360 mode.
+## Quality Controls
 
-## Quick Start
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `--resolution N` | 2048 (single), 6144 (DA360) | Controls splat density. Higher = more splats, sharper output |
+| `--overlap F` | 1.3 | Gaussian overlap factor. Higher = fewer gaps between splats |
+| `--disc-threshold F` | 0.1 | Depth discontinuity filter sensitivity. Lower = more aggressive edge removal |
+| `--fov N` | auto (EXIF) | Manual FOV override in degrees |
 
 ```bash
-# Single image (default: DA3 engine)
-python blunt.py photo.jpg --device cuda
+# Higher resolution (more splats)
+python blunt.py photo.jpg --resolution 3072 --device cuda
 
-# Single image with DA2 (lightweight fallback, no DA3 dependency needed)
-python blunt.py photo.jpg --engine da2 --device cuda
+# Sharper 360 (even more splats than default 6144)
+python blunt.py panorama.jpg --mode 360 --resolution 8192 --device cuda
 
-# Multi-image reconstruction (DA3: consistent depth + auto camera poses)
-python blunt.py img1.jpg img2.jpg img3.jpg --mode multi --device cuda
+# Tighter overlap (denser coverage)
+python blunt.py photo.jpg --overlap 1.5 --device cuda
+```
 
-# 360 panorama (force DA360 with auto-download from HuggingFace)
-python blunt.py panorama.jpg --mode 360 --engine da360 --device cuda
+## Feature Toggles
 
-# 360 panorama with local DA360 checkpoint
-python blunt.py panorama.jpg --mode 360 --da360-checkpoint DA360_large.pth --device cuda
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `--no-inpaint` | inpaint ON | Disables shadow filling behind depth edges. On by default to fill black gaps |
+| `--no-normalize` | normalize ON | Disables position/scale normalization. On by default for consistent viewer scale |
+| `--no-sky` | sky ON | Removes sky gaussians entirely (detected via depth + brightness + saturation) |
+| `--fast` | OFF | Adaptive stride -- keeps detail in complex areas, skips flat regions. 3-5x fewer splats |
+| `--segment` | OFF | Runs SAM2 segmentation, outputs `.segments.bin` + `.segments.json` alongside PLY |
 
-# 360 panorama with DA2 fallback (no checkpoint needed)
-python blunt.py panorama.jpg --mode 360 --device cuda
-
-# Apple Silicon GPU
-python blunt.py photo.jpg --device mps
-
-# Metric depth (DA2 only, real-world scale)
-python blunt.py photo.jpg --engine da2 --depth-mode metric-outdoor --device cuda
-
-# Fast mode (3-5x fewer splats)
-python blunt.py photo.jpg --fast --device cuda
-
-# Skip sky Gaussians
+```bash
+# Remove sky
 python blunt.py outdoor.jpg --no-sky --device cuda
+
+# Fast mode (fewer splats, faster)
+python blunt.py photo.jpg --fast --device cuda
 
 # Raw depth values (skip normalization)
 python blunt.py photo.jpg --no-normalize --device cuda
 
-# Manual FOV override
-python blunt.py photo.jpg --fov 90 --device cuda
+# With segmentation
+python blunt.py photo.jpg --segment --device cuda
 ```
 
-On first run, models are downloaded automatically from Hugging Face (~100MB for DA2, ~500MB for DA3-BASE, ~1.4GB for DA360).
+## DA2-Only Options
+
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `--depth-mode` | `relative` | `relative`, `metric-indoor`, or `metric-outdoor`. Real-world scale depth |
+
+```bash
+python blunt.py photo.jpg --engine da2 --depth-mode metric-outdoor --device cuda
+```
+
+## DA3 Options
+
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `--da3-model` | `DA3-BASE` | Model variant: `DA3-SMALL`, `DA3-BASE`, `DA3-LARGE`. Large/Giant are CC BY-NC 4.0 |
+
+```bash
+python blunt.py photo.jpg --da3-model DA3-LARGE --device cuda
+```
 
 ## Output
+
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `-o PATH` | `{input}_splat.ply` | Output file path |
+| `--device` | `cpu` | `cpu`, `cuda`, or `mps` (Apple Silicon) |
 
 Standard 3DGS binary PLY files. Load them in:
 - [SuperSplat](https://playcanvas.com/supersplat/editor)
 - [StorySplat](https://storysplat.com)
 - Any 3D Gaussian Splatting viewer
 
-## Options
+On first run, models are downloaded automatically from Hugging Face (~100MB for DA2, ~500MB for DA3-BASE, ~1.4GB for DA360).
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--mode` | auto | `single`, `360`, or `multi`. Auto-detected from input count (multiple files = `multi`, single file = `single`). |
-| `--engine` | auto | `da2`, `da3`, or `da360`. Auto-selected based on mode (see [Default Engine Selection](#default-engine-selection)). |
-| `--resolution` | `2048` | Processing resolution in pixels (higher = more splats). |
-| `--device` | `cpu` | `cpu`, `cuda`, or `mps` (Apple Silicon). |
-| `--depth-mode` | `relative` | `relative`, `metric-indoor`, or `metric-outdoor`. DA2 engine only. |
-| `--fov` | auto | Manual FOV override in degrees. Otherwise extracted from EXIF or falls back to `max(w,h) * 0.7` heuristic. |
-| `--no-sky` | off | Remove sky Gaussians entirely (detected via depth + brightness + saturation + connected components). |
-| `--fast` | off | Adaptive stride -- keeps detail in high-frequency areas, skips flat regions. 3-5x fewer splats. |
-| `--no-normalize` | off | Skip position/scale normalization. Outputs raw depth values instead of fitting the scene to a standard bounding volume. |
-| `--no-inpaint` | off | Disable occlusion inpainting (shadow filling behind depth edges). |
-| `--overlap` | `1.3` | Gaussian overlap factor (prevents gaps between splats). |
-| `--disc-threshold` | `0.1` | Depth discontinuity threshold for flying pixel removal. |
-| `--da3-model` | `DA3-BASE` | DA3 model variant: `DA3-SMALL`, `DA3-BASE`, `DA3-LARGE`. Note: `DA3-LARGE` and `DA3-GIANT` are CC BY-NC 4.0 (non-commercial). |
-| `--da360-checkpoint` | -- | Path to DA360 checkpoint file. If omitted, BLUNT looks for `da360/DA360_large.pth` relative to the script. |
-| `--segment` | off | Run SAM2 segmentation (generates `.segments.bin` + `.segments.json` alongside the PLY). |
-| `-o` | `{input}_splat.ply` | Output file path. |
+## What Each Feature Does
+
+- **Occlusion inpainting**: Before unprojecting pixels to 3D, detects depth edges and fills the "shadow" behind foreground objects with plausible depth+color. Without this, you get black gaps where the camera can't see behind objects.
+
+- **Normalization**: Centers the scene on its median and scales everything so the 98th percentile fits within +/-50 units. This means DA2, DA3, and DA360 outputs all load at the same scale in any viewer.
+
+- **Near-camera cull**: DA2's relative depth produces a curved shell artifact at the near plane. We cull the closest 2% of splats to fix this. DA3/DA360 use metric depth so this isn't needed.
+
+- **Floater pruning**: Compares each pixel's depth against its local neighborhood. Outliers (likely depth estimation errors) get their opacity reduced to 10%.
+
+- **Edge-aware scale/opacity**: Splats near depth edges are made smaller and slightly more transparent to reduce stretching artifacts at object boundaries.
 
 ## How It Works
 
@@ -130,7 +162,7 @@ Standard 3DGS binary PLY files. Load them in:
 1. **Resize** -- Image resized to processing resolution for depth estimation. Original image (up to 2048px) kept for high-res color sampling.
 2. **Depth estimation** -- DA3 (default) or DA2 produces a disparity/depth map. DA2 optionally uses metric depth models for real-world scale.
 3. **EXIF focal length** -- Extracts camera focal length from EXIF data (35mm equivalent or raw + crop factor). Falls back to `max(w,h) * 0.7` heuristic.
-4. **Depth processing** -- Median filter for noise reduction, then disparity-to-depth conversion via 1/d mapping (or direct meters for DA2 metric mode).
+4. **Depth processing** -- Median filter for noise reduction, then disparity-to-depth conversion via 1/d mapping (or direct meters for DA3 metric mode).
 5. **Occlusion inpainting** -- Detects depth discontinuities and fills the shadow regions behind foreground edges by inpainting both depth and color. Prevents black gaps in the final splat. Disable with `--no-inpaint`.
 6. **Unprojection** -- Projects each pixel into 3D using a pinhole camera model (DA3 uses predicted intrinsics).
 7. **Filtering** -- Removes bad splats:
@@ -148,8 +180,9 @@ Standard 3DGS binary PLY files. Load them in:
 Single-pass panoramic depth estimation -- no cube faces, no seams:
 
 1. **DA360 depth** -- Runs depth estimation directly on the equirectangular image using circular padding to handle 360 wrap-around and a learned shift parameter for scale-invariant output
-2. **Spherical unprojection** -- Projects each pixel into 3D using spherical coordinates (longitude/latitude to Cartesian), with latitude-aware Gaussian scaling
-3. **Filtering + normalization + output** -- Same filtering pipeline, normalization, and output as standard PLY
+2. **Resample** -- Image and depth resampled to unprojection grid resolution (default 6144x3072) for controlled splat density
+3. **Spherical unprojection** -- Projects each pixel into 3D using spherical coordinates (longitude/latitude to Cartesian), with latitude-aware Gaussian scaling
+4. **Filtering + normalization + output** -- Same filtering pipeline, normalization, and output as standard PLY
 
 ### 360 Panorama Pipeline (DA2 fallback)
 
@@ -206,11 +239,12 @@ write_ply(gaussians, "output_da2.ply")
 
 ## Performance
 
-| Setup | Single Image (2048px) | 360 (2048px) |
+| Setup | Single Image (2048px) | 360 (6144px) |
 |-------|----------------------|---------------|
-| NVIDIA T4 GPU | ~5 seconds | ~30 seconds |
-| Apple M-series (MPS) | ~10 seconds | ~60 seconds |
-| CPU | ~30 seconds | ~3 minutes |
+| NVIDIA RTX 4080 | ~5 seconds | ~16 seconds |
+| NVIDIA T4 GPU | ~10 seconds | ~40 seconds |
+| Apple M-series (MPS) | ~15 seconds | ~90 seconds |
+| CPU | ~30 seconds | ~5 minutes |
 
 Use `--fast` for 3-5x speedup with minimal quality loss.
 
